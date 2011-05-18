@@ -53,7 +53,7 @@ namespace Mono.VisualC.Code.Atoms {
 		internal protected override object InsideCodeTypeDeclaration (CodeTypeDeclaration decl)
 		{
 			if (decl.IsClass) {
-				var method = CreateWrapperMethod (decl.BaseTypes [0].BaseType != typeof (ICppObject).Name);
+				var method = CreateWrapperMethod ();
 
 				if (method == null || CommentedOut)
 					return null;
@@ -141,13 +141,13 @@ namespace Mono.VisualC.Code.Atoms {
 				method.ReturnType = new CodeTypeReference (typeof (void));
 			}
 
-			if (IsVirtual)	   method.CustomAttributes.Add (new CodeAttributeDeclaration ("Virtual"));
-			if (IsConstructor) method.CustomAttributes.Add (new CodeAttributeDeclaration ("Constructor"));
-			if (IsDestructor)  method.CustomAttributes.Add (new CodeAttributeDeclaration ("Destructor"));
-			if (IsConst)       method.CustomAttributes.Add (new CodeAttributeDeclaration ("Const"));
+			if (IsVirtual)	   method.CustomAttributes.Add (new CodeAttributeDeclaration (typeof (VirtualAttribute).Name));
+			if (IsConstructor) method.CustomAttributes.Add (new CodeAttributeDeclaration (typeof (ConstructorAttribute).Name));
+			if (IsDestructor)  method.CustomAttributes.Add (new CodeAttributeDeclaration (typeof (DestructorAttribute).Name));
+			if (IsConst)       method.CustomAttributes.Add (new CodeAttributeDeclaration (typeof (ConstAttribute).Name));
 
 			if (IsStatic)
-				method.CustomAttributes.Add (new CodeAttributeDeclaration ("Static"));
+				method.CustomAttributes.Add (new CodeAttributeDeclaration (typeof (StaticAttribute).Name));
 			else
 				method.Parameters.Add (new CodeParameterDeclarationExpression (typeof (CppInstancePtr).Name, "this"));
 
@@ -168,7 +168,7 @@ namespace Mono.VisualC.Code.Atoms {
 
 				// FIXME: Only add MangleAs attribute if the managed type chosen would mangle differently by default
 				if (!IsVirtual && !paramStr.Equals (string.Empty))
-					param.CustomAttributes.Add (new CodeAttributeDeclaration ("MangleAsAttribute", new CodeAttributeArgument (new CodePrimitiveExpression (paramStr))));
+					param.CustomAttributes.Add (new CodeAttributeDeclaration (typeof (MangleAsAttribute).Name, new CodeAttributeArgument (new CodePrimitiveExpression (paramStr))));
 
 				method.Parameters.Add (param);
 			}
@@ -176,7 +176,7 @@ namespace Mono.VisualC.Code.Atoms {
 			return method;
 		}
 
-		private CodeMemberMethod CreateWrapperMethod (bool hasBase)
+		private CodeMemberMethod CreateWrapperMethod ()
 		{
 			CodeMemberMethod method;
 
@@ -185,9 +185,16 @@ namespace Mono.VisualC.Code.Atoms {
 					Name = FormattedName,
 					Attributes = MemberAttributes.Public
 				};
-				if (hasBase)
-					ctor.BaseConstructorArgs.Add (new CodeFieldReferenceExpression (new CodeFieldReferenceExpression { FieldName = "impl" }, "TypeInfo"));
-
+				if (Klass.Bases.Count > 0) {
+					var typeInfo = new CodeFieldReferenceExpression (new CodeFieldReferenceExpression { FieldName = "impl" }, "TypeInfo");
+					ctor.BaseConstructorArgs.Add (typeInfo);
+					// The first public base class can use the subclass ctor as above, but for the rest, we do this to get the right CppTypeInfo
+					foreach (Class.BaseClass bc in Klass.Bases.Where (b => b.Access == Access.Public).Skip (1)) {
+						// FIXME: This won't work if one of the base classes ends up being generic
+						ctor.Statements.Add (new CodeObjectCreateExpression (bc.Name, typeInfo));
+					}
+					ctor.Statements.Add (new CodeMethodInvokeExpression (typeInfo, "CompleteType"));
+				}
 				method = ctor;
 			} else if (IsDestructor)
 				method = new CodeMemberMethod {
@@ -209,7 +216,7 @@ namespace Mono.VisualC.Code.Atoms {
 				//  get the intended effect if the managed method is overridden and the native method is not.
 				method.Attributes |= MemberAttributes.Final;
 			else if (IsVirtual && !IsDestructor)
-				method.CustomAttributes.Add (new CodeAttributeDeclaration ("OverrideNative"));
+				method.CustomAttributes.Add (new CodeAttributeDeclaration (typeof (OverrideNativeAttribute).Name));
 
 			for (int i = 0; i < Parameters.Count; i++) {
 				var param = GenerateParameterDeclaration (Parameters [i]);

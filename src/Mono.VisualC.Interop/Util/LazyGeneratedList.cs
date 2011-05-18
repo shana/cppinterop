@@ -37,13 +37,20 @@ namespace Mono.VisualC.Interop.Util {
 		private TItem [] cache;
 		private Func<int, TItem> generator;
 
-		private int skew;
+		private LazyGeneratedList<TItem> previous;
+		private LazyGeneratedList<TItem> next;
+		private int lead, content, follow;
+
+		private HashSet<int> removed;
 
 		public LazyGeneratedList (int count, Func<int, TItem> generator)
 		{
 			this.cache = new TItem [count];
 			this.generator = generator;
-			this.skew = 0;
+			this.lead = 0;
+			this.content = count;
+			this.follow = 0;
+			this.removed = new HashSet<int> ();
 		}
 
 		public IEnumerator<TItem> GetEnumerator ()
@@ -57,7 +64,7 @@ namespace Mono.VisualC.Interop.Util {
 		}
 
 		public int Count {
-			get { return cache.Length + skew; }
+			get { return lead + content + follow; }
 		}
 
 		public bool IsReadOnly {
@@ -66,22 +73,78 @@ namespace Mono.VisualC.Interop.Util {
 
 		public TItem this [int index] {
 			get {
-				int realIndex = index - skew;
-				if (realIndex < 0) return null;
-
-				if (cache [realIndex] == null)
-					cache [realIndex] = generator (realIndex);
-
-				return cache [realIndex];
+				return ForIndex (index, i => previous [i], i => (cache [i] == null? (cache [i] = generator (i)) : cache [i]), i => next [i]);
 			}
 			set {
 				throw new NotSupportedException ("This IList is read only");
 			}
 		}
 
-		public void Skew (int skew)
+		private TItem ForIndex (int index, Func<int,TItem> leadAction, Func<int,TItem> contentAction, Func<int,TItem> followAction)
 		{
-			this.skew += skew;
+			if (removed.Contains (index))
+				index++;
+
+			if (index < lead) {
+				if (previous != null && index >= 0)
+					return leadAction (index);
+				throw new IndexOutOfRangeException (index.ToString ());
+			}
+
+			int realIndex = index - lead;
+			if (realIndex >= content) {
+				int followIndex = realIndex - content;
+				if (next != null && followIndex < follow)
+					return followAction (followIndex);
+				throw new IndexOutOfRangeException (index.ToString ());
+			}
+
+			return contentAction (realIndex);
+		}
+
+		/* Visual aid for the behavior of the following methods:
+
+			|<Prepended Range><Generated Range><Appended Range>|
+			 ^               ^                 ^              ^
+			 PrependFirst    PrependLast       AppendFirst    AppendLast
+		*/
+
+		public void AppendFirst (LazyGeneratedList<TItem> list)
+		{
+			follow += list.Count;
+			if (next != null)
+				list.AppendLast (next);
+
+			next = list;
+		}
+
+		public void AppendLast (LazyGeneratedList<TItem> list)
+		{
+			if (next == null)
+				next = list;
+			else
+				next.AppendLast (list);
+
+			follow += list.Count;
+		}
+
+		public void PrependFirst (LazyGeneratedList<TItem> list)
+		{
+			if (previous == null)
+				previous = list;
+			else
+				previous.PrependFirst (list);
+
+			lead += list.Count;
+		}
+
+		public void PrependLast (LazyGeneratedList<TItem> list)
+		{
+			lead += list.Count;
+			if (previous != null)
+				list.PrependFirst (previous);
+
+			previous = list;
 		}
 
 		// FIXME: Should probably implement these 3 at some point
@@ -105,7 +168,11 @@ namespace Mono.VisualC.Interop.Util {
 		}
 		public void RemoveAt (int index)
 		{
-			throw new NotImplementedException ();
+			while (removed.Contains (index))
+				index++;
+
+			removed.Add (index);
+			content--;
 		}
 		public void Add (TItem item)
 		{

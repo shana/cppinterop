@@ -45,7 +45,7 @@ namespace Mono.VisualC.Interop {
 		public CppAbi Abi { get; private set; }
 		public Type NativeLayout {get; private set; }
 
-		public IList<MethodInfo> VirtualMethods { get; private set; }
+		public IList<PInvokeSignature> VirtualMethods { get; private set; }
 		public LazyGeneratedList<Type> VTableDelegateTypes { get; private set; }
 		public LazyGeneratedList<Delegate> VTableOverrides { get; private set; }
 
@@ -58,33 +58,31 @@ namespace Mono.VisualC.Interop {
 		public bool TypeComplete { get; private set; }
 
 		protected int native_size;
-		protected int field_offset_padding;
+		protected int field_offset_padding_without_vtptr;
 
 		private VTable lazy_vtable;
 
-		public CppTypeInfo (CppAbi abi, IEnumerable<MethodInfo> virtualMethods, Type nativeLayout)
+		public CppTypeInfo (CppAbi abi, IEnumerable<PInvokeSignature> virtualMethods, Type nativeLayout)
 		{
 			Abi = abi;
 			NativeLayout = nativeLayout;
 
-			VirtualMethods = new List<MethodInfo> (virtualMethods);
-			VTableDelegateTypes = new LazyGeneratedList<Type> (VirtualMethods.Count, VTableDelegateTypeGenerator);
-			VTableOverrides = new LazyGeneratedList<Delegate> (VirtualMethods.Count, VTableOverrideGenerator);
+			VirtualMethods = new List<PInvokeSignature> (virtualMethods);
+			VTableDelegateTypes = new LazyGeneratedList<Type> (VirtualMethods.Count, i => DelegateTypeCache.GetDelegateType (VirtualMethods [i]));
+			VTableOverrides = new LazyGeneratedList<Delegate> (VirtualMethods.Count, i => Abi.GetManagedOverrideTrampoline (this, i));
 
 			BaseClasses = new List<CppTypeInfo> ();
 			BaseVTableSlots = 0;
 			TypeComplete = false;
 
 			native_size = Marshal.SizeOf (nativeLayout);
-			field_offset_padding = 0;
+			field_offset_padding_without_vtptr = 0;
 
 			lazy_vtable = null;
 		}
 
 		public virtual void AddBase (CppTypeInfo baseType)
 		{
-			if (TypeComplete)
-				return;
 
 			// by default, do not add another vtable pointer for this new base class
 			AddBase (baseType, false);
@@ -92,6 +90,9 @@ namespace Mono.VisualC.Interop {
 
 		protected virtual void AddBase (CppTypeInfo baseType, bool addVTablePointer)
 		{
+			if (TypeComplete)
+				return;
+
 			BaseClasses.Add (baseType);
 
 			if (!addVTablePointer) {
@@ -103,12 +104,12 @@ namespace Mono.VisualC.Interop {
 					VirtualMethods.Insert (BaseVTableSlots + i, baseType.VirtualMethods [i]);
 	
 				BaseVTableSlots += newVirtualMethodCount;
-				VTableDelegateTypes.Skew (newVirtualMethodCount);
-				VTableOverrides.Skew (newVirtualMethodCount);
+				VTableDelegateTypes.PrependLast (baseType.VTableDelegateTypes);
+				VTableOverrides.PrependLast (baseType.VTableOverrides);
 			}
 
-			field_offset_padding += baseType.native_size +
-				(addVTablePointer? baseType.FieldOffsetPadding : baseType.field_offset_padding);
+			field_offset_padding_without_vtptr += baseType.native_size +
+				(addVTablePointer? baseType.FieldOffsetPadding : baseType.field_offset_padding_without_vtptr);
 		}
 
 		public int CountBases (Func<CppTypeInfo, bool> predicate)
@@ -121,7 +122,6 @@ namespace Mono.VisualC.Interop {
 			return count;
 		}
 
-		// FIXME: Make this thread safe?
 		public virtual void CompleteType ()
 		{
 			if (TypeComplete)
@@ -131,16 +131,25 @@ namespace Mono.VisualC.Interop {
 				baseClass.CompleteType ();
 
 			TypeComplete = true;
+			RemoveVTableDuplicates (ms => true);
+		}
 
+		protected virtual void RemoveVTableDuplicates (Predicate<MethodSignature> pred)
+		{
 			// check that any virtual methods overridden in a subclass are only included once
-			HashSet<MethodSignature> vsignatures = new HashSet<MethodSignature> ();
-			for (int i = 0; i < VirtualMethods.Count; i++) {
-				MethodSignature sig = GetVTableMethodSignature (i);
+			var vsignatures = new HashSet<MethodSignature> ();
 
-				if (vsignatures.Contains (sig))
-					VirtualMethods.RemoveAt (i--);
-				else
+			for (int i = 0; i < VirtualMethods.Count; i++) {
+				var sig = VirtualMethods [i];
+				if (sig == null)
+					continue;
+
+				if (vsignatures.Contains (sig)) {
+					if (pred (sig))
+						VirtualMethods.RemoveAt (i--);
+				} else {
 					vsignatures.Add (sig);
+				}
 			}
 		}
 
@@ -174,7 +183,7 @@ namespace Mono.VisualC.Interop {
 		// the extra padding to allocate at the top of the class before the fields begin
 		//  (by default, just the vtable pointer)
 		public virtual int FieldOffsetPadding {
-			get { return field_offset_padding + (VirtualMethods.Any ()? Marshal.SizeOf (typeof (IntPtr)) : 0); }
+			get { return field_offset_padding_without_vtptr + (VirtualMethods.Any ()? Marshal.SizeOf (typeof (IntPtr)) : 0); }
 		}
 
 		// the padding in the data pointed to by the vtable pointer before the list of function pointers starts
@@ -185,33 +194,6 @@ namespace Mono.VisualC.Interop {
 		// the amount of extra room alloc'd after the function pointer list of the vtbl
 		public virtual int VTableBottomPadding {
 			get { return 0; }
-		}
-
-		public virtual MethodSignature GetVTableMethodSignature (int index)
-		{
-			MethodInfo method = VirtualMethods [index];
-			return new MethodSignature () { Name = method.Name,
-			                                Type = Abi.GetMethodType (method),
-			                                Signature = GetVTableDelegateSignature (index) };
-		}
-
-		public virtual DelegateSignature GetVTableDelegateSignature (int index)
-		{
-			MethodInfo method = VirtualMethods [index];
-			var psig = Abi.GetPInvokeSignature (this, method);
-			return new DelegateSignature () { ParameterTypes = psig.ParameterTypes,
-			                                  ReturnType = method.ReturnType,
-			                                  CallingConvention = Abi.GetCallingConvention (method) };
-		}
-
-		private Type VTableDelegateTypeGenerator (int index)
-		{
-			return DelegateTypeCache.GetDelegateType (GetVTableDelegateSignature (index));
-		}
-
-		private Delegate VTableOverrideGenerator (int index)
-		{
-			return Abi.GetManagedOverrideTrampoline (this, index);
 		}
 		
 	}
